@@ -1,0 +1,182 @@
+From 5b18b1c112e4e047ed1ee2bd195263105b72fd2f Mon Sep 17 00:00:00 2001
+From: Tom Dohrmann <erbse.13@gmx.de>
+Date: Thu, 4 Jan 2024 20:44:02 +0000
+Subject: [PATCH 2/7] always use sev_init_ex, but don't touch disk
+
+We need sev_init_ex to trigger the bug, but we don't actually care
+about saving and restoring the region to/from disk.
+---
+ drivers/crypto/ccp/sev-dev.c | 136 ++++-------------------------------
+ 1 file changed, 14 insertions(+), 122 deletions(-)
+
+diff --git a/drivers/crypto/ccp/sev-dev.c b/drivers/crypto/ccp/sev-dev.c
+index 2878fc3ac303..5739b6949f46 100644
+--- a/drivers/crypto/ccp/sev-dev.c
++++ b/drivers/crypto/ccp/sev-dev.c
+@@ -354,107 +354,15 @@ static void *sev_fw_alloc(unsigned long len)
+ 	return page_address(page);
+ }
+ 
+-static struct file *open_file_as_root(const char *filename, int flags, umode_t mode)
+-{
+-	struct file *fp;
+-	struct path root;
+-	struct cred *cred;
+-	const struct cred *old_cred;
+-
+-	task_lock(&init_task);
+-	get_fs_root(init_task.fs, &root);
+-	task_unlock(&init_task);
+-
+-	cred = prepare_creds();
+-	if (!cred)
+-		return ERR_PTR(-ENOMEM);
+-	cred->fsuid = GLOBAL_ROOT_UID;
+-	old_cred = override_creds(cred);
+-
+-	fp = file_open_root(&root, filename, flags, mode);
+-	path_put(&root);
+-
+-	revert_creds(old_cred);
+-
+-	return fp;
+-}
+-
+ static int sev_read_init_ex_file(void)
+ {
+-	struct sev_device *sev = psp_master->sev_data;
+-	struct file *fp;
+-	ssize_t nread;
+-
+ 	lockdep_assert_held(&sev_cmd_mutex);
+ 
+ 	if (!sev_init_ex_buffer)
+ 		return -EOPNOTSUPP;
+ 
+-	fp = open_file_as_root(init_ex_path, O_RDONLY, 0);
+-	if (IS_ERR(fp)) {
+-		int ret = PTR_ERR(fp);
+-
+-		if (ret == -ENOENT) {
+-			dev_info(sev->dev,
+-				"SEV: %s does not exist and will be created later.\n",
+-				init_ex_path);
+-			ret = 0;
+-		} else {
+-			dev_err(sev->dev,
+-				"SEV: could not open %s for read, error %d\n",
+-				init_ex_path, ret);
+-		}
+-		return ret;
+-	}
+-
+-	nread = kernel_read(fp, sev_init_ex_buffer, NV_LENGTH, NULL);
+-	if (nread != NV_LENGTH) {
+-		dev_info(sev->dev,
+-			"SEV: could not read %u bytes to non volatile memory area, ret %ld\n",
+-			NV_LENGTH, nread);
+-	}
+-
+-	dev_dbg(sev->dev, "SEV: read %ld bytes from NV file\n", nread);
+-	filp_close(fp, NULL);
+-
+-	return 0;
+-}
+-
+-static int sev_write_init_ex_file(void)
+-{
+-	struct sev_device *sev = psp_master->sev_data;
+-	struct file *fp;
+-	loff_t offset = 0;
+-	ssize_t nwrite;
+-
+-	lockdep_assert_held(&sev_cmd_mutex);
+-
+-	if (!sev_init_ex_buffer)
+-		return 0;
+-
+-	fp = open_file_as_root(init_ex_path, O_CREAT | O_WRONLY, 0600);
+-	if (IS_ERR(fp)) {
+-		int ret = PTR_ERR(fp);
+-
+-		dev_err(sev->dev,
+-			"SEV: could not open file for write, error %d\n",
+-			ret);
+-		return ret;
+-	}
+-
+-	nwrite = kernel_write(fp, sev_init_ex_buffer, NV_LENGTH, &offset);
+-	vfs_fsync(fp, 0);
+-	filp_close(fp, NULL);
+-
+-	if (nwrite != NV_LENGTH) {
+-		dev_err(sev->dev,
+-			"SEV: failed to write %u bytes to non volatile memory area, ret %ld\n",
+-			NV_LENGTH, nwrite);
+-		return -EIO;
+-	}
+-
+-	dev_dbg(sev->dev, "SEV: write successful to NV file\n");
+-
++	// Always start with a completly erased flash.
++	memset(sev_init_ex_buffer, 0xff, NV_LENGTH);
+ 	return 0;
+ }
+ 
+@@ -464,24 +372,13 @@ static int sev_write_init_ex_file_if_required(int cmd_id)
+ 
+ 	if (!sev_init_ex_buffer)
+ 		return 0;
+-
+-	/*
+-	 * Only a few platform commands modify the SPI/NV area, but none of the
+-	 * non-platform commands do. Only INIT(_EX), PLATFORM_RESET, PEK_GEN,
+-	 * PEK_CERT_IMPORT, and PDH_GEN do.
+-	 */
+-	switch (cmd_id) {
+-	case SEV_CMD_FACTORY_RESET:
+-	case SEV_CMD_INIT_EX:
+-	case SEV_CMD_PDH_GEN:
+-	case SEV_CMD_PEK_CERT_IMPORT:
+-	case SEV_CMD_PEK_GEN:
+-		break;
+-	default:
+-		return 0;
+-	}
+-
+-	return sev_write_init_ex_file();
++	
++	// Skip this for two reasons:
++	// 1. The buffer won't be readable when we remove the pfn from the direct
++	//    map before transitioning it into the CONTEXT state.
++	// 2. We want to hammer the PSP as quickly as possible. Writing the buffer
++	//    back to disk is both slow and unnecessary, so we just don't do it.
++	return 0;
+ }
+ 
+ static int alloc_snp_host_map(struct sev_device *sev)
+@@ -2398,16 +2295,11 @@ void sev_pci_init(void)
+ 	if (sev_update_firmware(sev->dev) == 0)
+ 		sev_get_api_version();
+ 
+-	/* If an init_ex_path is provided rely on INIT_EX for PSP initialization
+-	 * instead of INIT.
+-	 */
+-	if (init_ex_path) {
+-		sev_init_ex_buffer = sev_fw_alloc(NV_LENGTH);
+-		if (!sev_init_ex_buffer) {
+-			dev_err(sev->dev,
+-				"SEV: INIT_EX NV memory allocation failed\n");
+-			goto err;
+-		}
++	sev_init_ex_buffer = sev_fw_alloc(NV_LENGTH);
++	if (!sev_init_ex_buffer) {
++		dev_err(sev->dev,
++			"SEV: INIT_EX NV memory allocation failed\n");
++		goto err;
+ 	}
+ 
+ 	/* Initialize the platform */
+-- 
+2.34.1
+

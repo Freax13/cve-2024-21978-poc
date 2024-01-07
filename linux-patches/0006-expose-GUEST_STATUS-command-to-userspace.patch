@@ -1,0 +1,139 @@
+From 2d92b5bbe0163b9c7bca8c9ab40fe7c36eadf5e7 Mon Sep 17 00:00:00 2001
+From: Tom Dohrmann <erbse.13@gmx.de>
+Date: Thu, 4 Jan 2024 20:55:51 +0000
+Subject: [PATCH 6/7] expose GUEST_STATUS command to userspace
+
+We'll use this to read back memory from corrupted guest context pages
+to check whether we corrupted a guest context page in a useful way.
+---
+ arch/x86/kvm/svm/sev.c       | 51 ++++++++++++++++++++++++++++++++++++
+ drivers/crypto/ccp/sev-dev.c | 31 ++++++++++++++++++++++
+ include/uapi/linux/kvm.h     |  1 +
+ 3 files changed, 83 insertions(+)
+
+diff --git a/arch/x86/kvm/svm/sev.c b/arch/x86/kvm/svm/sev.c
+index 7e2c65df9241..0a7320fb0362 100644
+--- a/arch/x86/kvm/svm/sev.c
++++ b/arch/x86/kvm/svm/sev.c
+@@ -2434,6 +2434,54 @@ static int snp_set_instance_certs(struct kvm *kvm, struct kvm_sev_cmd *argp)
+ 	return ret;
+ }
+ 
++typedef struct snp_guest_status_buffer {
++    uint64_t policy;
++    uint32_t asid;
++    uint8_t state;
++    uint8_t reserved;
++    uint8_t reserved2[2];
++    uint32_t vcek_dis : 1;  /* Bit 0 - Value of VcekDis for this guest */
++    uint32_t reservedbits : 31;  /* Bits 1 to 31 */
++    uint32_t reserved3;
++    uint64_t reserved4;
++} snp_guest_status_buffer_t;
++
++int snp_guest_status(u64 gctx_pfn, u64 dst_pfn, int *error);
++
++int do_snp_guest_status(struct kvm *kvm, struct kvm_sev_cmd *argp)
++{
++	struct kvm_sev_info *sev = &to_kvm_svm(kvm)->sev_info;
++	struct page *tmp_page;
++	u64 dst_pfn;
++	u64 gctx_pfn;
++	int ret;
++
++	if (!sev_snp_guest(kvm))
++		return -ENOTTY;
++
++	if (!sev->snp_context)
++		return -EINVAL;
++
++	gctx_pfn = __pa(sev->snp_context) >> PAGE_SHIFT;
++
++	tmp_page = alloc_page(GFP_KERNEL_ACCOUNT);
++	if (!tmp_page)
++		return -ENOMEM;
++	dst_pfn = page_to_pfn(tmp_page);
++
++	ret = snp_guest_status(gctx_pfn, dst_pfn, &argp->error);
++	if (ret)
++		goto free_tmp_page;
++
++	if (copy_to_user((void __user *)(uintptr_t)argp->data, page_address(tmp_page), sizeof(snp_guest_status_buffer_t)))
++		ret = -EFAULT;
++
++free_tmp_page:
++	__free_page(tmp_page);
++
++	return ret;
++}
++
+ int sev_mem_enc_ioctl(struct kvm *kvm, void __user *argp)
+ {
+ 	struct kvm_sev_cmd sev_cmd;
+@@ -2539,6 +2587,9 @@ int sev_mem_enc_ioctl(struct kvm *kvm, void __user *argp)
+ 	case KVM_SEV_SNP_SET_CERTS:
+ 		r = snp_set_instance_certs(kvm, &sev_cmd);
+ 		break;
++	case KVM_SEV_SNP_GUEST_STATUS:
++		r = do_snp_guest_status(kvm, &sev_cmd);
++		break;
+ 	default:
+ 		r = -EINVAL;
+ 		goto out;
+diff --git a/drivers/crypto/ccp/sev-dev.c b/drivers/crypto/ccp/sev-dev.c
+index 72cde6952477..ff8143a53e74 100644
+--- a/drivers/crypto/ccp/sev-dev.c
++++ b/drivers/crypto/ccp/sev-dev.c
+@@ -2017,6 +2017,37 @@ int snp_guest_dbg_decrypt_page(u64 gctx_pfn, u64 src_pfn, u64 dst_pfn, int *erro
+ }
+ EXPORT_SYMBOL_GPL(snp_guest_dbg_decrypt_page);
+ 
++int snp_guest_status(u64 gctx_pfn, u64 dst_pfn, int *error)
++{
++	struct sev_data_snp_guest_status data = {0};
++	struct sev_device *sev;
++	int ret;
++
++	if (!psp_master || !psp_master->sev_data)
++		return -ENODEV;
++
++	sev = psp_master->sev_data;
++
++	if (!sev->snp_initialized)
++		return -EINVAL;
++
++	data.gctx_paddr = sme_me_mask | (gctx_pfn << PAGE_SHIFT);
++	data.address = sme_me_mask | (dst_pfn << PAGE_SHIFT);
++
++	/* The destination page must be in the firmware state. */
++	if (rmp_mark_pages_firmware(data.address, 1, false))
++		return -EIO;
++
++	ret = sev_do_cmd(SEV_CMD_SNP_GUEST_STATUS, &data, error);
++
++	/* Restore the page state */
++	if (snp_reclaim_pages(data.address, 1, false))
++		ret = -EIO;
++
++	return ret;
++}
++EXPORT_SYMBOL_GPL(snp_guest_status);
++
+ static void sev_snp_certs_release(struct kref *kref)
+ {
+ 	struct sev_snp_certs *certs = container_of(kref, struct sev_snp_certs, kref);
+diff --git a/include/uapi/linux/kvm.h b/include/uapi/linux/kvm.h
+index 0444e122ac5e..c1862db99ee0 100644
+--- a/include/uapi/linux/kvm.h
++++ b/include/uapi/linux/kvm.h
+@@ -1975,6 +1975,7 @@ enum sev_cmd_id {
+ 	KVM_SEV_SNP_LAUNCH_FINISH,
+ 	KVM_SEV_SNP_GET_CERTS,
+ 	KVM_SEV_SNP_SET_CERTS,
++	KVM_SEV_SNP_GUEST_STATUS,
+ 
+ 	KVM_SEV_NR_MAX,
+ };
+-- 
+2.34.1
+

@@ -1,0 +1,34 @@
+From 7a73d784609ef8adc433b6ca792f8e7b138c9c7c Mon Sep 17 00:00:00 2001
+From: Tom Dohrmann <erbse.13@gmx.de>
+Date: Thu, 4 Jan 2024 20:47:24 +0000
+Subject: [PATCH 4/7] expose snp_reclaim_pages
+
+We'll also use this in sev.c.
+---
+ drivers/crypto/ccp/sev-dev.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/crypto/ccp/sev-dev.c b/drivers/crypto/ccp/sev-dev.c
+index 004ad69a2cfd..72cde6952477 100644
+--- a/drivers/crypto/ccp/sev-dev.c
++++ b/drivers/crypto/ccp/sev-dev.c
+@@ -229,7 +229,7 @@ static int sev_cmd_buffer_len(int cmd)
+ 	return 0;
+ }
+ 
+-static int snp_reclaim_pages(unsigned long paddr, unsigned int npages, bool locked)
++int snp_reclaim_pages(unsigned long paddr, unsigned int npages, bool locked)
+ {
+ 	/* Cbit maybe set in the paddr */
+ 	unsigned long pfn = __sme_clr(paddr) >> PAGE_SHIFT;
+@@ -263,6 +263,7 @@ static int snp_reclaim_pages(unsigned long paddr, unsigned int npages, bool lock
+ 	snp_leak_pages(pfn, npages - n);
+ 	return ret;
+ }
++EXPORT_SYMBOL_GPL(snp_reclaim_pages);
+ 
+ static int rmp_mark_pages_firmware(unsigned long paddr, unsigned int npages, bool locked)
+ {
+-- 
+2.34.1
+

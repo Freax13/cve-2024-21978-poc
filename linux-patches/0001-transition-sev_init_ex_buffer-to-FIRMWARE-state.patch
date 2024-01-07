@@ -1,0 +1,46 @@
+From 646a295d8279e0de4ef628d34c6ceaa56a6f9b28 Mon Sep 17 00:00:00 2001
+From: Tom Dohrmann <erbse.13@gmx.de>
+Date: Thu, 4 Jan 2024 20:41:11 +0000
+Subject: [PATCH 1/7] transition sev_init_ex_buffer to FIRMWARE state
+
+The SEV firmware requires this. This was missing from the v10 patches,
+but was also fixed in the v11 patches.
+---
+ drivers/crypto/ccp/sev-dev.c | 14 +++++++++++++-
+ 1 file changed, 13 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/crypto/ccp/sev-dev.c b/drivers/crypto/ccp/sev-dev.c
+index 21a3064f30c9..2878fc3ac303 100644
+--- a/drivers/crypto/ccp/sev-dev.c
++++ b/drivers/crypto/ccp/sev-dev.c
+@@ -910,6 +910,12 @@ static int __sev_init_locked(int *error)
+ static int __sev_init_ex_locked(int *error)
+ {
+ 	struct sev_data_init_ex data;
++	int rc;
++
++	if (sev_init_ex_buffer) {
++		rmp_mark_pages_firmware(__psp_pa(sev_init_ex_buffer), 8, true);
++	}
++
+ 
+ 	memset(&data, 0, sizeof(data));
+ 	data.length = sizeof(data);
+@@ -927,7 +933,13 @@ static int __sev_init_ex_locked(int *error)
+ 		data.tmr_len = sev_es_tmr_size;
+ 	}
+ 
+-	return __sev_do_cmd_locked(SEV_CMD_INIT_EX, &data, error);
++	rc = __sev_do_cmd_locked(SEV_CMD_INIT_EX, &data, error);
++
++	if (sev_init_ex_buffer) {
++		snp_reclaim_pages(__psp_pa(sev_init_ex_buffer), 8, true);
++	}
++
++	return rc;
+ }
+ 
+ static inline int __sev_do_init_locked(int *psp_ret)
+-- 
+2.34.1
+

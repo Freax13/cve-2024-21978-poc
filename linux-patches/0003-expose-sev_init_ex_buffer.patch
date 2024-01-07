@@ -1,0 +1,30 @@
+From f89b62b1268513c711565474e016e8cc49f47075 Mon Sep 17 00:00:00 2001
+From: Tom Dohrmann <erbse.13@gmx.de>
+Date: Thu, 4 Jan 2024 20:47:04 +0000
+Subject: [PATCH 3/7] expose sev_init_ex_buffer
+
+We'll need to access this in sev.c.
+---
+ drivers/crypto/ccp/sev-dev.c | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/drivers/crypto/ccp/sev-dev.c b/drivers/crypto/ccp/sev-dev.c
+index 5739b6949f46..004ad69a2cfd 100644
+--- a/drivers/crypto/ccp/sev-dev.c
++++ b/drivers/crypto/ccp/sev-dev.c
+@@ -88,6 +88,12 @@ static void *sev_es_tmr;
+ #define NV_LENGTH (32 * 1024)
+ static void *sev_init_ex_buffer;
+ 
++void* get_sev_init_ex_buffer(void)
++{
++	return sev_init_ex_buffer;
++}
++EXPORT_SYMBOL_GPL(get_sev_init_ex_buffer);
++
+ /*
+  * SEV_DATA_RANGE_LIST:
+  *   Array containing range of pages that firmware transitions to HV-fixed
+-- 
+2.34.1
+
